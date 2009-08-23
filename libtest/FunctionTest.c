@@ -25,6 +25,8 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <unistd.h>
+
 int testAdd(int a, int b)
 {
     return a + b;
@@ -32,11 +34,21 @@ int testAdd(int a, int b)
 
 void* testAddPointer()
 {
-  return testAdd;
+    return testAdd;
 };
 
 int testFunctionAdd(int a, int b, int (*f)(int, int))
 {
     return f(a, b);
 };
+
+void testBlocking(int seconds) {
+    sleep(seconds);
+};
+
+void* testBlockingPointer()
+{
+    return testBlocking;
+}
+
 

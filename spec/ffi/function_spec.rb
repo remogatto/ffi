@@ -6,6 +6,7 @@ describe FFI::Function do
     ffi_lib TestLibrary::PATH
     attach_function :testFunctionAdd, [:int, :int, :pointer], :int
     attach_function :testAddPointer, [], :pointer
+    attach_function :testBlockingPointer, [], :pointer
   end
   it 'is initialized with a signature and a block' do
     FFI::Function.new(:int, []) { }
@@ -43,5 +44,15 @@ describe FFI::Function do
     end
     fp.attach(foo.singleton_class, 'add')
     foo.add(10, 10).should == 20    
+  end
+  it 'can wrap a blocking function' do
+    unless RUBY_VERSION =~ /1.8/
+      fp = FFI::Function.new(:void, [ :int ], LibTest.testBlockingPointer, :blocking => true)
+      time = Time.now
+      threads = []
+      threads << Thread.new { fp.call(2) }
+      threads << Thread.new(time) { (Time.now - time).should < 1 }
+      threads.each { |t| t.join }
+    end
   end
 end
