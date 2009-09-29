@@ -49,22 +49,15 @@
 #include "Type.h"
 #include "LastError.h"
 #include "Call.h"
+#include "ClosurePool.h"
 #include "Function.h"
-
-#if defined(HAVE_LIBFFI) && !defined(HAVE_FFI_CLOSURE_ALLOC)
-static void* ffi_closure_alloc(size_t size, void** code);
-static void ffi_closure_free(void* ptr);
-ffi_status ffi_prep_closure_loc(ffi_closure* closure, ffi_cif* cif,
-        void (*fun)(ffi_cif*, void*, void**, void*),
-        void* user_data, void* code);
-#endif /* HAVE_FFI_CLOSURE_ALLOC */
 
 typedef struct Function_ {
     AbstractMemory memory;
     FunctionType* info;
     MethodHandle* methodHandle;
     bool autorelease;
-    ffi_closure* ffiClosure;
+    Closure* closure;
     VALUE rbProc;
     VALUE rbFunctionInfo;
 } Function;
@@ -73,10 +66,11 @@ static void function_mark(Function *);
 static void function_free(Function *);
 static VALUE function_init(VALUE self, VALUE rbFunctionInfo, VALUE rbProc);
 static void callback_invoke(ffi_cif* cif, void* retval, void** parameters, void* user_data);
+static bool callback_prep(void* ctx, void* code, Closure* closure, char* errmsg, size_t errmsgsize);
 
 VALUE rbffi_FunctionClass = Qnil;
 
-static ID id_call = 0, id_cbtable = 0;
+static ID id_call = 0, id_cbtable = 0, id_cb_ref = 0;
 
 static VALUE
 function_allocate(VALUE klass)
@@ -110,8 +104,8 @@ function_free(Function *fn)
         rbffi_MethodHandle_Free(fn->methodHandle);
     }
 
-    if (fn->ffiClosure != NULL && fn->autorelease) {
-        ffi_closure_free(fn->ffiClosure);
+    if (fn->closure != NULL && fn->autorelease) {
+        rbffi_Closure_Free(fn->closure);
     }
 
     xfree(fn);
@@ -166,21 +160,35 @@ rbffi_Function_NewInstance(VALUE rbFunctionInfo, VALUE rbProc)
 VALUE
 rbffi_Function_ForProc(VALUE rbFunctionInfo, VALUE proc)
 {
-    VALUE callback;
-    VALUE cbTable = RTEST(rb_ivar_defined(proc, id_cbtable)) ? rb_ivar_get(proc, id_cbtable) : Qnil;
+    VALUE callback, cbref, cbTable;
+    Function* fp;
 
-    if (cbTable == Qnil) {
-        cbTable = rb_hash_new();
-        rb_ivar_set(proc, id_cbtable, cbTable);
+    cbref = RTEST(rb_ivar_defined(proc, id_cb_ref)) ? rb_ivar_get(proc, id_cb_ref) : Qnil;
+    /* If the first callback reference has the same function function signature, use it */
+    if (cbref != Qnil && CLASS_OF(cbref) == rbffi_FunctionClass) {
+        Data_Get_Struct(cbref, Function, fp);
+        if (fp->rbFunctionInfo == rbFunctionInfo) {
+            return cbref;
+        }
     }
-
-    callback = rb_hash_aref(cbTable, rbFunctionInfo);
-    if (callback != Qnil) {
+    
+    cbTable = RTEST(rb_ivar_defined(proc, id_cbtable)) ? rb_ivar_get(proc, id_cbtable) : Qnil;
+    if (cbTable != Qnil && (callback = rb_hash_aref(cbTable, rbFunctionInfo)) != Qnil) {
         return callback;
     }
-
+    
+    /* No existing function for the proc with that signature, create a new one and cache it */
     callback = rbffi_Function_NewInstance(rbFunctionInfo, proc);
-    rb_hash_aset(cbTable, rbFunctionInfo, callback);
+    if (cbref == Qnil) {
+        /* If there is no other cb already cached for this proc, we can use the ivar slot */
+        rb_ivar_set(proc, id_cb_ref, callback);
+    } else {
+        /* The proc instance has been used as more than one type of callback, store extras in a hash */
+        cbTable = rb_hash_new();
+        rb_ivar_set(proc, id_cbtable, cbTable);
+        rb_hash_aset(cbTable, rbFunctionInfo, callback);
+    }
+
     return callback;
 }
 
@@ -201,27 +209,23 @@ function_init(VALUE self, VALUE rbFunctionInfo, VALUE rbProc)
         fn->memory = *memory;
 
     } else if (rb_obj_is_kind_of(rbProc, rb_cProc) || rb_respond_to(rbProc, id_call)) {
-        void* code;
-        ffi_status status;
-        fn->ffiClosure = ffi_closure_alloc(sizeof(*fn->ffiClosure), &code);
-        if (fn->ffiClosure == NULL) {
-            rb_raise(rb_eNoMemError, "Failed to allocate libffi closure");
+        if (fn->info->closurePool == NULL) {
+            fn->info->closurePool = rbffi_ClosurePool_New(sizeof(ffi_closure), callback_prep, fn->info);
+            if (fn->info->closurePool == NULL) {
+                rb_raise(rb_eNoMemError, "failed to create closure pool");
+            }
         }
 
-        status = ffi_prep_closure_loc(fn->ffiClosure, &fn->info->ffi_cif,
-                callback_invoke, fn, code);
-        if (status != FFI_OK) {
-            rb_raise(rb_eArgError, "ffi_prep_closure_loc failed");
-        }
-
-        fn->memory.address = code;
-        fn->memory.size = sizeof(*fn->ffiClosure);
+        fn->closure = rbffi_Closure_Alloc(fn->info->closurePool);
+        fn->closure->info = fn;
+        fn->memory.address = fn->closure->code;
+        fn->memory.size = sizeof(*fn->closure);
         fn->autorelease = true;
 
     } else {
         rb_raise(rb_eTypeError, "wrong argument type.  Expected pointer or proc");
     }
-
+    
     fn->rbProc = rbProc;
 
     return self;
@@ -234,7 +238,7 @@ function_call(int argc, VALUE* argv, VALUE self)
 
     Data_Get_Struct(self, Function, fn);
 
-    return rbffi_CallFunction(argc, argv, fn->memory.address, fn->info);
+    return (*fn->info->invoke)(argc, argv, fn->memory.address, fn->info);
 }
 
 static VALUE
@@ -259,7 +263,7 @@ function_attach(VALUE self, VALUE module, VALUE name)
     snprintf(var, sizeof(var), "@@%s", StringValueCStr(name));
     rb_cv_set(module, var, self);
 
-    rb_define_module_function(module, StringValueCStr(name),
+    rb_define_singleton_method(module, StringValueCStr(name),
             rbffi_MethodHandle_CodeAddress(fn->methodHandle), -1);
 
     
@@ -298,12 +302,12 @@ function_release(VALUE self)
 
     Data_Get_Struct(self, Function, fn);
 
-    if (fn->ffiClosure == NULL) {
+    if (fn->closure == NULL) {
         rb_raise(rb_eRuntimeError, "cannot free function which was not allocated");
     }
     
-    ffi_closure_free(fn->ffiClosure);
-    fn->ffiClosure = NULL;
+    rbffi_Closure_Free(fn->closure);
+    fn->closure = NULL;
     
     return self;
 }
@@ -311,7 +315,8 @@ function_release(VALUE self)
 static void
 callback_invoke(ffi_cif* cif, void* retval, void** parameters, void* user_data)
 {
-    Function* fn = (Function *) user_data;
+    Closure* closure = (Closure *) user_data;
+    Function* fn = (Function *) closure->info;
     FunctionType *cbInfo = fn->info;
     VALUE* rbParams;
     VALUE rbReturnValue;
@@ -434,46 +439,20 @@ callback_invoke(ffi_cif* cif, void* retval, void** parameters, void* user_data)
 }
 
 
-#if defined(HAVE_LIBFFI) && !defined(HAVE_FFI_CLOSURE_ALLOC)
-/*
- * versions of ffi_closure_alloc, ffi_closure_free and ffi_prep_closure_loc for older
- * system libffi versions.
- */
-static void*
-ffi_closure_alloc(size_t size, void** code)
+static bool
+callback_prep(void* ctx, void* code, Closure* closure, char* errmsg, size_t errmsgsize)
 {
-    void* closure;
-    closure = mmap(NULL, size, PROT_READ | PROT_WRITE,
-             MAP_ANON | MAP_PRIVATE, -1, 0);
-    if (closure == (void *) -1) {
-        return NULL;
-    }
-    memset(closure, 0, size);
-    *code = closure;
-    return closure;
-}
+    FunctionType* fnInfo = (FunctionType *) ctx;
+    ffi_status ffiStatus;
 
-static void
-ffi_closure_free(void* ptr)
-{
-    if (ptr != NULL && ptr != (void *) -1) {
-        munmap(ptr, sizeof(ffi_closure));
+    ffiStatus = ffi_prep_closure(code, &fnInfo->ffi_cif, callback_invoke, closure);
+    if (ffiStatus != FFI_OK) {
+        snprintf(errmsg, errmsgsize, "ffi_prep_closure failed.  status=%#x", ffiStatus);
+        return false;
     }
-}
 
-ffi_status
-ffi_prep_closure_loc(ffi_closure* closure, ffi_cif* cif,
-        void (*fun)(ffi_cif*, void*, void**, void*),
-        void* user_data, void* code)
-{
-    ffi_status retval = ffi_prep_closure(closure, cif, fun, user_data);
-    if (retval == FFI_OK) {
-        mprotect(closure, sizeof(ffi_closure), PROT_READ | PROT_EXEC);
-    }
-    return retval;
+    return true;
 }
-
-#endif /* HAVE_FFI_CLOSURE_ALLOC */
 
 void
 rbffi_Function_Init(VALUE moduleFFI)
@@ -494,5 +473,6 @@ rbffi_Function_Init(VALUE moduleFFI)
 
     id_call = rb_intern("call");
     id_cbtable = rb_intern("@__ffi_callback_table__");
+    id_cb_ref = rb_intern("@__ffi_callback__");
 }
 

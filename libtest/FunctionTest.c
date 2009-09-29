@@ -32,11 +32,6 @@ int testAdd(int a, int b)
     return a + b;
 };
 
-void* testAddPointer()
-{
-    return testAdd;
-};
-
 int testFunctionAdd(int a, int b, int (*f)(int, int))
 {
     return f(a, b);
@@ -45,10 +40,5 @@ int testFunctionAdd(int a, int b, int (*f)(int, int))
 void testBlocking(int seconds) {
     sleep(seconds);
 };
-
-void* testBlockingPointer()
-{
-    return testBlocking;
-}
 
 

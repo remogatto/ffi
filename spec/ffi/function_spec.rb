@@ -1,12 +1,14 @@
 require File.expand_path(File.join(File.dirname(__FILE__), "spec_helper"))
 
 describe FFI::Function do
-  module LibTest
-    extend FFI::Library
-    ffi_lib TestLibrary::PATH
-    attach_function :testFunctionAdd, [:int, :int, :pointer], :int
-    attach_function :testAddPointer, [], :pointer
-    attach_function :testBlockingPointer, [], :pointer
+  before do
+    module LibTest
+      extend FFI::Library
+      ffi_lib TestLibrary::PATH
+      attach_function :testFunctionAdd, [:int, :int, :pointer], :int
+    end
+    @libtest = FFI::DynamicLibrary.open(TestLibrary::PATH, 
+                                        FFI::DynamicLibrary::RTLD_LAZY | FFI::DynamicLibrary::RTLD_GLOBAL)
   end
   it 'is initialized with a signature and a block' do
     FFI::Function.new(:int, []) { }
@@ -26,16 +28,16 @@ describe FFI::Function do
     LibTest.testFunctionAdd(10, 10, function_add).should == 20
   end
   it 'can be used to wrap an existing function pointer' do
-    FFI::Function.new(:int, [:int, :int], LibTest.testAddPointer).call(10, 10).should == 20
+    FFI::Function.new(:int, [:int, :int], @libtest.find_function('testAdd')).call(10, 10).should == 20
   end
   it 'can be attached to a module' do
     module Foo; end
-    fp = FFI::Function.new(:int, [:int, :int], LibTest.testAddPointer)
+    fp = FFI::Function.new(:int, [:int, :int], @libtest.find_function('testAdd'))
     fp.attach(Foo, 'add')
     Foo.add(10, 10).should == 20
   end
   it 'can be used to extend an object' do
-    fp = FFI::Function.new(:int, [:int, :int], LibTest.testAddPointer)
+    fp = FFI::Function.new(:int, [:int, :int], @libtest.find_function('testAdd'))
     foo = Object.new
     class << foo
       def singleton_class
@@ -47,12 +49,25 @@ describe FFI::Function do
   end
   it 'can wrap a blocking function' do
     unless RUBY_VERSION =~ /1.8/
-      fp = FFI::Function.new(:void, [ :int ], LibTest.testBlockingPointer, :blocking => true)
+      fp = FFI::Function.new(:void, [ :int ], @libtest.find_function('testBlocking'), :blocking => true)
       time = Time.now
       threads = []
       threads << Thread.new { fp.call(2) }
       threads << Thread.new(time) { (Time.now - time).should < 1 }
       threads.each { |t| t.join }
     end
+  end
+  it 'autorelease flag is set to true by default' do
+    fp = FFI::Function.new(:int, [:int, :int], @libtest.find_function('testAdd'))
+    fp.autorelease?.should be_true
+  end
+  it 'can explicity free itself' do
+    fp = FFI::Function.new(:int, []) { }
+    fp.free
+    lambda { fp.free }.should raise_error RuntimeError
+  end
+  it 'can\'t explicity free itself if not previously allocated' do
+    fp = FFI::Function.new(:int, [:int, :int], @libtest.find_function('testAdd'))
+    lambda { fp.free }.should raise_error RuntimeError
   end
 end
